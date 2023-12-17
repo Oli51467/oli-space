@@ -1,8 +1,108 @@
 ## context
 
-参考视频：[Bilibili-小徐先生1212-解说Golang context实现原理](https://www.bilibili.com/video/BV1EA41127Q3/)
+参考文章&视频：[Bilibili-小徐先生1212-解说Golang context实现原理](https://www.bilibili.com/video/BV1EA41127Q3/)
 
-小徐先生1212公众号文章：[Golang context 实现原理](https://mp.weixin.qq.com/s/AavRL-xezwsiQLQ1OpLKmA)
+[Golang context 实现原理](https://mp.weixin.qq.com/s/AavRL-xezwsiQLQ1OpLKmA)
+
+[Go标准库Context | 李文周的博客 (liwenzhou.com)](https://www.liwenzhou.com/posts/Go/context/)
+
+对于一个调用链路，context可以很好地做到多个goroutine之间的信息传递、信息共享，可以实现取消信号、截止时间等操作。
+
+### Context接口
+
+`context.Context`是一个接口，该接口定义了四个需要实现的方法。
+
+Context是线程安全的，可以放心的在多个goroutine中传递
+
+```go
+type Context interface {
+    Deadline() (deadline time.Time, ok bool)	// 当前Context被取消的时间	
+    Done() <-chan struct{}								// 这个Channel会在当前工作完成或者上下文被取消之后关闭，多次调用Done方法会返回同一个Channel
+    Err() error
+    Value(key interface{}) interface{}
+}
+```
+
+其中：
+
+- `Deadline`方法需要返回当前`Context`被取消的时间，也就是完成工作的截止时间（deadline）
+- `Done`方法需要返回一个`Channel`，这个Channel会在当前工作完成或者上下文被取消之后关闭，多次调用`Done`方法会返回同一个Channel；
+- ```Err```方法会返回当前```Context```结束的原因，它只会在```Done```返回的Channel被关闭时才会返回非空的值:
+  - 如果当前`Context`被取消就会返回`Canceled`错误
+  - 如果当前`Context`超时就会返回`DeadlineExceeded`错误
+- `Value`方法会从`Context`中返回键对应的值，对于同一个上下文来说，多次调用`Value` 并传入相同的`Key`会返回相同的结果，该方法仅用于传递跨API和进程间跟请求域的数据
+
+Go内置两个函数：`Background()`和`TODO()`，这两个函数分别返回一个实现了`Context`接口的`background`和`todo`。这两个内置的上下文对象一般是作为最顶层的`partent context`，衍生出更多的子上下文对象。
+
+`background`和`todo`本质上都是`emptyCtx`结构体类型，是一个**不可取消**，**没有设置截止时间**，**没有携带任何值**的Context。它与空结构体不同，他有明确且独一无二的地址。
+
+```go
+// An emptyCtx is never canceled, has no values, and has no deadline. It is not
+// struct{}, since vars of this type must have distinct addresses.
+type emptyCtx int
+
+var (
+	background = new(emptyCtx)
+	todo       = new(emptyCtx)
+)
+
+// Background returns a non-nil, empty Context. It is never canceled, has no
+// values, and has no deadline. It is typically used by the main function,
+// initialization, and tests, and as the top-level Context for incoming
+// requests.
+func Background() Context {
+	return background
+}
+```
+
+### With函数
+
+#### WithCancel
+
+```func WithCancel(parent Context) (ctx Context, cancel CancelFunc)```
+
+`WithCancel`返回带有新Done通道的父节点的**副本**。当调用返回的cancel函数或当关闭父上下文的Done通道时，将关闭返回上下文的Done通道，无论先发生什么情况。
+
+#### WithDeadline
+
+```func WithDeadline(parent Context, deadline time.Time) (Context, CancelFunc)```
+
+返回父上下文的**副本**，并将deadline调整为不迟于d。如果父上下文的deadline已经早于d，则WithDeadline等同于父上下文。
+
+当截止日过期时，或当调用返回的cancel函数时，或者当父上下文的Done通道关闭时，返回上下文的Done通道将被关闭，以最先发生的情况为准。
+
+```go
+func main() {
+	d := time.Now().Add(50 * time.Millisecond)	// 定义了一个50毫秒之后过期的deadline
+	ctx, cancel := context.WithDeadline(context.Background(), d)
+
+	// 尽管ctx会过期，但在任何情况下调用它的cancel函数都是很好的实践。
+	// 如果不这样做，可能会使上下文及其父类存活的时间超过必要的时间。
+	defer cancel()
+
+	// 等待1秒后打印overslept退出或者等待ctx过期后退出。
+	select {
+	case <-time.After(1 * time.Second):
+		fmt.Println("overslept")
+	case <-ctx.Done():
+		fmt.Println(ctx.Err())	// 因为ctx 50毫秒后就会过期，所以ctx.Done()会先接收到context到期通知，并且会打印ctx.Err()的内容。
+	}
+}
+```
+
+#### WithTimeout
+
+```func WithTimeout(parent Context, timeout time.Duration) (Context, CancelFunc)```
+
+`WithTimeout`返回`WithDeadline(parent, time.Now().Add(timeout))`
+
+#### WithValue
+
+`WithValue`函数能够将请求作用域的数据与 Context 对象建立关系
+
+`func WithValue(parent Context, key, val interface{}) Context`
+
+所提供的键必须是可比较的，并且不应该是`string`类型或任何其他内置类型
 
 ## 数据结构
 
@@ -27,23 +127,279 @@ type StringHeader struct {
 
 ```s = string([]rune(s)[:3])```
 
-
-
 ### slice
 
-在64位机器下，所有切片的长度都是24字节。
+#### 楔子
+
+##### 示例1:
+
+```go
+func Test_slice(t *testing.T) {
+	s := make([]int, 10)	// 长度为10，容量也为10
+	s = append(s, 10)
+	t.Logf("s: %v, len of s: %d, cap of s: %d", s, len(s), cap(s))
+}
+```
+
+运行结果：
+
+```go
+=== RUN   Test_slice
+    slice_test.go:8: s: [0 0 0 0 0 0 0 0 0 0 10], len of s: 11, cap of s: 20
+--- PASS: Test_slice (0.00s)
+PASS
+```
+
+##### 示例2:
+
+```go
+func Test_slice1(t *testing.T) {
+	s := make([]int, 0, 10)	// 长度为0，容量为10
+	s = append(s, 10)
+	t.Logf("s: %v, len of s: %d, cap of s: %d", s, len(s), cap(s))
+}
+```
+
+运行结果：
+
+```go
+=== RUN   Test_slice1
+    slice_test.go:14: s: [10], len of s: 1, cap of s: 10
+--- PASS: Test_slice1 (0.00s)
+PASS
+```
+
+##### 示例3:
+
+```go
+func Test_slice2(t *testing.T) {
+	s := make([]int, 10, 11)	// 长度为10，容量为11
+	s = append(s, 10)
+	t.Logf("s: %v, len of s: %d, cap of s: %d", s, len(s), cap(s))
+}
+```
+
+运行结果：
+
+```go
+=== RUN   Test_slice2
+    slice_test.go:20: s: [0 0 0 0 0 0 0 0 0 0 10], len of s: 11, cap of s: 11
+--- PASS: Test_slice2 (0.00s)
+PASS
+```
+
+##### 示例4:
+
+```go
+func Test_slice4(t *testing.T) {
+	s := make([]int, 10, 12)	// s长度为10，容量为12
+	s1 := s[8:]								// 截取切片s index=8往后的内容赋给s1
+	t.Logf("s1: %v, len of s1: %d, cap of s1: %d", s1, len(s1), cap(s1))
+}
+```
+
+运行结果：
+
+```go
+=== RUN   Test_slice4
+    slice_test.go:26: s1: [0 0], len of s1: 2, cap of s1: 4
+--- PASS: Test_slice4 (0.00s)
+PASS
+```
+
+截取所得新切片 s1 的长度和容量强依赖于原切片 s 的长度和容量，并在此基础上减去头部 8 个未使用到的单位。
+
+##### 示例5:
+
+```go
+func Test_slice5(t *testing.T) {
+	s := make([]int, 10, 12) // s的长度为10，容量为12
+	s1 := s[8:9]             // 截取切片s index为[8, 9)范围内的元素赋给切片s1
+	t.Logf("s1: %v, len of s1: %d, cap of s1: %d", s1, len(s1), cap(s1))
+}
+```
+
+运行结果：
+
+```go
+=== RUN   Test_slice5
+    slice_test.go:32: s1: [0], len of s1: 1, cap of s1: 4
+--- PASS: Test_slice5 (0.00s)
+PASS
+```
+
+##### 示例6:
+
+```go
+func Test_slice6(t *testing.T) {
+	s := make([]int, 10, 12) // s的长度为10，容量为12
+	s1 := s[8:]              // 截取切片s index=8往后的内容赋给s1
+	s1[0] = -1							 // 改变s1是否会影响到s
+	t.Logf("s: %v", s)
+}
+```
+
+运行结果：
+
+```go
+=== RUN   Test_slice6
+    slice_test.go:39: s: [0 0 0 0 0 0 0 0 -1 0]
+--- PASS: Test_slice6 (0.00s)
+PASS
+```
+
+s1 是在 s 基础上截取得到的，属于一次引用传递，底层共用同一片内存空间，其中 s[x] 等价于 s1[x+8]. 因此修改了 s1[0] 会直接影响到 s[8]。
+
+##### 示例7:
+
+```go
+func Test_slice7(t *testing.T) {
+	s := make([]int, 10, 12) // s的长度为10，容量为12
+	v := s[10]               // 会越界
+	t.Logf("v: %v", v)
+}
+```
+
+##### 示例8:
+
+```go
+func Test_slice8(t *testing.T) {
+	s := make([]int, 10, 12) // s的长度为10，容量为12
+	s1 := s[8:]
+	s1 = append(s1, []int{10, 11, 12}...)
+	v := s[10] 							// 会越界
+	t.Logf("v: %v", v)
+}
+```
+
+- 在 s 的基础上截取产生了 s1，此时 s1 和 s 复用的是同一份内存地址
+- 接下来执行 append 操作时，由于 s 预留的空间不足，s1 会发生扩容
+- s1 扩容后，会被迁移到新的空间地址，此时 s1 已经和 s 做到真正意义上的完全独立，意味着修改 s1 不再会影响到 s
+- s 继续维持原本的长度值 10 和容量值 12，因此访问 s[10] 会panic
+
+#####  示例8.1
+
+```go
+func Test_slice8-1(t *testing.T) {
+	s := make([]int, 10, 12) // s的长度为10，容量为12
+	s1 := s[8:]
+	s1 = append(s1, 11)
+	v := s[10] 							 // 仍然会越界
+}
+```
+
+s1在追加后只会改变s1对应示例的slice的len字段，而这两个slice实例背后对应的存储数据的内存数据的地址是相同的。所以在```s1 = append(s1, 11)```后s1的len是3，cap是4；s的len仍然是10，cap是12，虽然`s[10]`的位置上已经被设置为11，但访问的位置小于len，故仍然会panic。
+
+##### 示例9:
+
+```go
+func Test_slice9(t *testing.T) {
+	s := make([]int, 10, 12) // s的长度为10，容量为12
+	s1 := s[8:]				 			 // 截取切片s index=8往后的内容赋给s1
+	changeSlice(s1)
+	t.Logf("s: %v", s)
+}
+
+func changeSlice(s1 []int) {
+	s1[0] = -1
+}
+```
+
+运行结果：
+
+```go
+=== RUN   Test_slice9
+    slice_test.go:60: s: [0 0 0 0 0 0 0 0 -1 0]
+--- PASS: Test_slice9 (0.00s)
+PASS
+```
+
+##### 示例10:
+
+```go
+func Test_slice10(t *testing.T) {
+	s := make([]int, 10, 12) // s的长度为10，容量为12
+	s1 := s[8:]              // 截取切片s index=8往后的内容赋给s1
+	changeSlice1(s1)		     // 在方法中对s1进行append追加操作
+	t.Logf("s: %v, len of s: %d, cap of s: %d", s, len(s), cap(s))
+	t.Logf("s1: %v, len of s1: %d, cap of s1: %d", s1, len(s1), cap(s1))
+}
+
+func changeSlice1(s1 []int) {
+	s1 = append(s1, 10)
+}
+```
+
+运行结果：
+
+```go
+=== RUN   Test_slice10
+    slice_test.go:71: s: [0 0 0 0 0 0 0 0 0 0], len of s: 10, cap of s: 12
+    slice_test.go:72: s1: [0 0], len of s1: 2, cap of s1: 4
+--- PASS: Test_slice10 (0.00s)
+PASS
+```
+
+虽然切片是引用传递，但是在方法调用时，传递的会是一个新的 slice。
+
+因此在局部方法 changeSlice1 中，虽然对 s1 进行了 append 操作，但这这会在局部方法中这个独立的 slice 中生效，不会影响到原方法 Test_slice10 当中的 s 和 s1 的长度和容量。
+
+##### 示例11:
+
+```go
+func Test_slice11(t *testing.T) {
+	s := []int{0, 1, 2, 3, 4}
+	s = append(s[:2], s[3:]...) // 截取s中index=2前面的内容，并在此基础上追加index=3后面的内容
+	t.Logf("s: %v, len of s: %d, cap of s: %d", s, len(s), cap(s))
+	v := s[4]
+	t.Logf("v: %v", v)	// 会越界
+}
+```
+
+运行结果：
+
+```go
+=== RUN   Test_slice11
+    slice_test.go:82: s: [0 1 3 4], len of s: 4, cap of s: 5
+--- FAIL: Test_slice11 (0.00s)
+```
+
+##### 示例12:
+
+```go
+func Test_slice12(t *testing.T) {
+	s := make([]int, 512)
+	s = append(s, 1)
+	t.Logf("len of s: %d, cap of s: %d", len(s), cap(s))
+}
+```
+
+运行结果：
+
+```go
+=== RUN   Test_slice12
+    slice_test.go:90: len of s: 513, cap of s: 1024
+--- PASS: Test_slice12 (0.00s)
+PASS
+```
+
+不同golang版本的运行结果不同。
+
+在64位机器下，所有切片的长度都是24字节（每个字段占8字节）。
 
 **切片实质是对底层数组的引用**
 
 ```go
 type slice struct {
-	array unsafe.Pointer
-	len   int
-	cap   int	// 实际存储数据的字节数组长度
+	array unsafe.Pointer	// 指向连续内存空间地址的起点
+	len   int							// 逻辑意义上slice中实际存放了多少个元素
+	cap   int							// 实际存储数据的字节数组长度
 }
 ```
 
-#### 创建slice的方式
+由于在slice中存放了内存空间的地址，在传递slice切片的时候，虽然进行的是值拷贝，但内部存放的地址是相同的，因此**对于slice本身属于引用传递**。因此在局部方法中如果触发了slice的扩容，会影响拷贝出的副本的len和cap字段，但是不会对外部的slice中的len和cap字段产生影响
+
+#### 初始化
 
 1. 通过字面量创建，在编译时创建一个数组，再创建一个slice，将数组的引用传进去
 
@@ -63,24 +419,54 @@ type slice struct {
 
    调用```runtime.makeslice()```方法，返回切片的指针
 
+   ```go
+   func makeslice(et *_type, len, cap int) unsafe.Pointer {
+       // 结合每个元素的大小以及切片的容量，计算出初始化切片所需要的内存空间大小
+       mem, overflow := math.MulUintptr(et.size, uintptr(cap))
+       if overflow || mem > maxAlloc || len < 0 || len > cap {
+           // 倘若容量超限，len 取负值或者 len 超过 cap，直接 panic
+           mem, overflow := math.MulUintptr(et.size, uintptr(len))
+           if overflow || mem > maxAlloc || len < 0 {
+               panicmakeslicelen()
+           }
+           panicmakeslicecap()
+       }
+       // 调用位于 runtime/malloc.go 文件中的 mallocgc 方法，为切片进行内存空间的分配
+       return mallocgc(mem, et, true)
+   }
+   ```
+
 3. 通过数组创建
 
    ```go
-   arr := [5]int{0,1,2,3,4}
+   arr := [5]int{0,1,2,3,4}	// 此时slice的长度和容量均为5
    slice := arr[1:4]
    ```
 
    创建后将0忽略，cap=4，len=3
 
-#### 切片的追加
+#### 截取元素
 
-1. 添加后的长度小于容量cap时，编译时只调整len，并将追加的数据添加到数组后面
-2. 添加后的长度大于容量cap时，编译时调用```runtime.growslice()```，原来的数组不要了，新开一个数组。因为数组在内存中必须连续，原来的数组后面的内存地址可能会越界。
-3. 扩容时：
-   1. 如果期望容量大于当前容量的两倍就会使用期望容量。
-   2. 否则，如果当前切片长度小于1024，则将容量翻倍。
-   3. 如果大于1024，则每次增加25%。
-   4. 切片在扩容时，**并发不安全**，需要加锁。
+对切片截取时，本质是引用传递操作，不论如何截取，底层复用的都是同一块内存空间的数据，但截取动作会创建出一个新的slice示例
+
+#### 追加元素
+
+1. 添加后的len小于容量cap时，编译时只调整len，并将追加的数据添加到数组后面
+
+2. 添加后的len大于容量cap时，编译时调用```runtime.growslice()```，**原来的数组不要了，新开一个数组**。因为数组在内存中必须连续，原来的数组后面的内存地址可能会越界。
+
+3. 扩容时（v1.19）：
+
+   1. 倘若切片元素大小为 0（元素类型为 struct{}），则直接复用一个全局的 zerobase 实例，直接返回
+   2. 如果期望容量大于当前容量的两倍就会使用期望容量。
+   3. 否则，如果当前切片长度小于256，则直接将容量翻倍。
+   4. 如果当前切片长度大于等于256，则在当前容量的基础上扩容1/4的比例并且累加192的数值，如此循环直到得到的新容量大于等于预期容量为止。
+   5. 结合 mallocgc 流程中，对内存分配单元 mspan 的等级制度，推算得到实际需要申请的内存空间大小。
+   6. 调用 mallocgc，对新切片进行内存初始化。
+   7. 调用 memmove 方法，将老切片中的内容拷贝到新切片中。
+   8. 返回扩容后的新切片。
+
+   切片在扩容时，**并发不安全**，需要加锁。
 
 ```go
 func growslice(et *_type, old slice, cap int) slice {
@@ -107,7 +493,57 @@ func growslice(et *_type, old slice, cap int) slice {
 }
 ```
 
+#### 删除元素
 
+本质是内容截取
+
+如果需要删除 slice 中间的某个元素，操作思路则是采用内容截取加上元素追加的复合操作，可以先截取待删除元素的左侧部分内容，然后在此基础上追加上待删除元素后侧部分的内容：
+
+```go
+func Test_slice(t *testing.T){
+    s := []int{0,1,2,3,4}
+    // 删除 index = 2 的元素
+    s = append(s[:2],s[3:]...)
+    // s: [0,1,3,4], len: 4, cap: 5
+    t.Logf("s: %v, len: %d, cap: %d", s, len(s), cap(s))
+}
+```
+
+当我们需要删除 slice 中的所有元素时，也可以采用切片内容截取的操作方式：s[:0]. 这样操作后，slice header 中的指针 array 仍指向远处，但是逻辑意义上其长度 len 已经等于 0，而容量 cap 则仍保留为原值。
+
+```go
+func Test_slice(t *testing.T){
+    s := []int{0,1,2,3,4}
+    s = s[:0]
+    // s: [], len: 0, cap: 5
+    t.Logf("s: %v, len: %d, cap: %d", s, len(s), cap(s))
+}
+```
+
+#### 切片拷贝
+
+##### 浅拷贝
+
+对切片的字面量进行赋值传递即可，这样相当于创建出了一个新的 slice 实例，但是其中的指针 array、容量 cap 和长度 len 仍和老的 slice实例相同。
+
+```go
+func Test_slice(t *testing.T) {
+    s := []int{0, 1, 2, 3, 4}
+    s1 := s
+}
+```
+
+##### 深拷贝
+
+创建出一个和 slice**容量大小相等**的独立的内存区域，并将原 slice 中的元素一一拷贝到新空间中。可以调用系统方法 copy。
+
+```go
+func Test_slice(t *testing.T) {
+    s := []int{0, 1, 2, 3, 4}
+    s1 := make([]int, len(s))
+    copy(s1, s)
+}
+```
 
 ### runtime.hmap
 
@@ -211,8 +647,6 @@ func mapassign() {
 #### hmap的并发问题
 
 如果一个map**在扩容中**，A协程在读取某个key的数据时，另一个协程B在修改key对应的数据，操作完后，将旧桶的数据驱逐到了新桶。则A协程会读到错误的数据或者找不到数据。
-
-
 
 ### sync.Map
 
@@ -336,8 +770,6 @@ sync.Map使用了readMap和dirtyMap，分离了可能引发扩容的操作：不
 
 这么做的意义是，提醒后面操作该key的协程：该key已经被删除，且没有被重建到dirtyMap中，如果该协程要删除该key的话，直接将其全部删掉而不是将value的指针置为nil。
 
-
-
 ### interface
 
 接口值的底层表示
@@ -379,8 +811,6 @@ var c = *int
 a = c
 fmt.println(a == nil) // false 此时a对应的eface中data为nil，type为*int
 ```
-
-
 
 ### nil
 
@@ -762,9 +1192,6 @@ func chansend() {
 	if c.qcount < c.dataqsiz {
 		// Space is available in the channel buffer. Enqueue the element to send.
 		qp := chanbuf(c, c.sendx)
-		if raceenabled {
-			racenotify(c, c.sendx, nil)
-		}
     // 移动到对应内存区域
 		typedmemmove(c.elemtype, qp, ep)
 		c.sendx++
@@ -836,9 +1263,6 @@ func chanrecv() {
 func recv() {
   // 判断缓冲区为空
   if c.dataqsiz == 0 {
-		if raceenabled {
-			racesync(c, sg)
-		}
     // 直接接收
 		if ep != nil {
 			// copy data from sender
@@ -967,16 +1391,19 @@ Mutex的结构：
 
 有多个协程竞争Locked位时，会使用```atomic.CompareAndSwap()```进行加锁，必然有一个协程加锁成功，其余协程加锁失败。若加锁成功会继续执行业务，若加锁失败先会自旋尝试一段时间，若仍失败则尝试获取sema信号量，此时sema为0必然获取失败，则**将该协程加入SemaRoot结构体的treap中休眠等待**，并在```sync.Mutex```的```state```的```WaiterShift```变量中记录有一个休眠的协程。
 
+```sync.Mutex```结合两种方案的使用场景，反映了面对并发环境通过持续试探逐渐由乐观转为悲观的态度。
+
+- 自旋累计达到4次仍未取得锁时转为阻塞模式
+- CPU**单核**或**仅有单个P调度器**时直接转为阻塞模式
+- 当前P的执行队列中仍有待执行的G（避免因自旋影响到GMP调度效率）
+
 ##### 加锁
 
 ```go
 // Lock 加锁
 func (m *Mutex) Lock() {
-	// 直接获取锁成功
+	// 当前未上锁且锁内不存在阻塞协程，直接尝试CAS获取锁
 	if atomic.CompareAndSwapInt32(&m.state, 0, mutexLocked) {
-		if race.Enabled {
-			race.Acquire(unsafe.Pointer(m))
-		}
 		return
 	}
 	// 开始尝试自选
@@ -988,9 +1415,10 @@ func (m *Mutex) Lock() {
 func (m *Mutex) lockSlow() {
 	...
 	for {
-		// 判断这把锁仍在在锁着，并且不在饥饿模式，则可以自旋
+		// 判断这把锁仍在在锁着，并且处于正常模式，且仍然符合自旋条件
 		if old&(mutexLocked|mutexStarving) == mutexLocked && runtime_canSpin(iter) {
-			// 判断是不是在睡眠模式后刚刚醒来
+			// 进入if分支：当前锁阻塞队列有协程，但还未被唤醒，因此需要将mutexWoken置为1
+      // 避免再有其他协程被唤醒和自己抢锁
 			if !awoke && old&mutexWoken == 0 && old>>mutexWaiterShift != 0 &&
 				atomic.CompareAndSwapInt32(&m.state, old, old|mutexWoken) {
 				awoke = true
@@ -1003,7 +1431,7 @@ func (m *Mutex) lockSlow() {
 		new := old
 		// 如果没有在饥饿模式下 可以继续尝试加锁
 		if old&mutexStarving == 0 {
-			new |= mutexLocked
+			new |= mutexLocked	// 先将新状态置为1
 		}
     // 如果被锁并且在处于饥饿模式，直接将该协程放入SemaRoot的等待队列中
 		if old&(mutexLocked|mutexStarving) != 0 {
@@ -1030,11 +1458,11 @@ func (m *Mutex) lockSlow() {
       // 被唤醒后：
       // 计算是否因为自己等待时间过长进入饥饿模式
       starving = starving || runtime_nanotime()-waitStartTime > starvationThresholdNs
-      // 如果是饥饿模式
+      // 如果被唤醒之前已经是饥饿模式
       if old&mutexStarving != 0 {
-        // 直接退出等待队列
+        // 直接退出等待队列 等待协程数减一
 				delta := int32(mutexLocked - 1<<mutexWaiterShift)
-        // 判断是否还处于饥饿模式
+        // 判断是不是阻塞队列中最后一个出队的协程 或者等锁时间小于1ms 如果是：关闭饥饿模式
 				if !starving || old>>mutexWaiterShift == 1 {
 					delta -= mutexStarving
 				}
@@ -1049,10 +1477,6 @@ func (m *Mutex) lockSlow() {
 			old = m.state
 		}
 	}
-
-	if race.Enabled {
-		race.Acquire(unsafe.Pointer(m))
-	}
 }
 ```
 
@@ -1061,12 +1485,7 @@ func (m *Mutex) lockSlow() {
 ```go
 // Unlock 解锁
 func (m *Mutex) Unlock() {
-	if race.Enabled {
-		_ = m.state
-		race.Release(unsafe.Pointer(m))
-	}
-
-	// 直接令最后一位减一 -> 解锁
+	// 直接令最后一位减一：解锁
 	new := atomic.AddInt32(&m.state, -mutexLocked)
 	// 如果还有在该锁上阻塞的协程 尝试唤醒一个treap中的协程
 	if new != 0 {
@@ -1083,12 +1502,7 @@ func (m *Mutex) unlockSlow(new int32) {
 	if new&mutexStarving == 0 {
 		old := new
 		for {
-			// If there are no waiters or a goroutine has already
-			// been woken or grabbed the lock, no need to wake anyone.
-			// In starvation mode ownership is directly handed off from unlocking
-			// goroutine to the next waiter. We are not part of this chain,
-			// since we did not observe mutexStarving when we unlocked the mutex above.
-			// So get off the way.
+			// 判断是否需要执行唤醒动作
 			if old>>mutexWaiterShift == 0 || old&(mutexLocked|mutexWoken|mutexStarving) != 0 {
 				return
 			}
@@ -1120,7 +1534,7 @@ func (m *Mutex) unlockSlow(new int32) {
 - 在饥饿模式下，新参与竞争锁的协程不自旋，直接进入SemaRoot休眠等待。
 
 - 被唤醒的协程直接获取锁，**与其竞争的其他协程直接进入SemaRoot休眠。**
-- 没有协程在SemaRoot的队列中继续等待时，回到正常模式。
+- 没有协程在SemaRoot的队列中继续等待时，或者协程等待锁的时间小于1ms。回到正常模式。
 
 饥饿模式可以避免大量的协程自旋，是一种公平锁。
 
@@ -1349,5 +1763,106 @@ func (o *Once) doSlow(f func()) {
 
 
 
-## 内存模型&垃圾回收
+## MM&GC
+
+### 栈内存（协程栈、调用栈）
+
+协程栈记录了协程的**执行路径、局部变量、和函数传参和返回值**。
+
+协程栈位于堆内存上，普通方法栈底是用于协程调度回退的```goexit()```方法，main方法执行前先调用```runtime.main()```方法，```runtime.main()```再调用```main.main()```
+
+#### 协程栈编译时分配的不够大怎么办
+
+栈帧回收后，需要继续使用的变量或者太大的变量可能会内存逃逸到堆上。
+
+指针逃逸：方法返回的指针在上一级方法中继续使用，该指针会逃逸到堆上。
+
+空接口逃逸：如果函数的形参类型为interface{}，实参很可能会逃逸，因为interface{}类型的函数往往会使用反射来查看传入的值实际的类型，反射的对象要求往往是在堆上而不是栈上。
+
+大变量逃逸：64位机器中，一般超过64KB的变量会逃逸到堆上。
+
+调用层数过多：**栈初始空间位2KB**，在函数调用前会使用```morestack()```判断栈空间是否还充足，```golang1.13```以后使用连续栈扩容，**当空间不足时变为原来的2倍**，将原来的栈拷贝到新栈中。当空间使用率不足1/4时缩容，变为原来的1/2
+
+### 堆内存
+
+位于操作系统的虚拟内存上，Go进程每次申请**虚拟内存单元**【**heapArena**】为64MB，最多有```2^20```个虚拟内存单元，所有的heapArena组成了mheap（堆内存）
+
+![](../imgs/golang-mm-heaparena.png)
+
+#### heapArena的分配--分级分配
+
+根据隔离适应策略，使用内存时的最小单位为mspan，每个mspan为N个相同大小的格子，Go中一共有68级span
+
+![](../imgs/golang-heaparena-mspan.png)
+
+### GC
+
+
+
+## TCP网络编程
+
+### Socket
+
+操作系统提供了Socket作为TCP通信的抽象
+
+通信过程：
+
+![](../imgs/golang-web-socket.png)
+
+IO模型指的是操作Socket的方案。
+
+### 阻塞IO
+
+每一个线程服务于一个客户端，当客户端没有消息时，线程会陷入内核态。当读写成功后，切换回用户态，继续执行。**内核态切换的开销是极大的。**
+
+### 非阻塞IO
+
+轮询所有的Socket，直到某一个Socket可以读写。不会陷入内核态，自由度高，但需要自旋。
+
+### 多路复用
+
+将监听多个Socket的任务从业务转移到了操作系统，由操作系统帮我们负责。将多个Socket事件注册到event poll中，当有事件发生时，操作系统会把事件列表返回。
+
+### 结合阻塞模型和多路复用
+
+在底层使用操作系统的多路复用IO，在协程层次使用阻塞模型，阻塞协程将协程休眠。
+
+在Go中，network poller抽象了底层的epoll
+
+```go
+func netpollinit() {
+	// 拿到epoll file descriptor
+	epfd = epollcreate1(_EPOLL_CLOEXEC)
+	// 新建Epoll
+	if epfd < 0 {
+		epfd = epollcreate(1024)
+		if epfd < 0 {
+			println("runtime: epollcreate failed with", -epfd)
+			throw("runtime: netpollinit failed")
+		}
+		closeonexec(epfd)
+	}
+	// 新建一个linux的pipe管道用于中断Epoll
+	r, w, errno := nonblockingPipe()
+	ev := epollevent{
+		events: _EPOLLIN,
+	}
+	*(**uintptr)(unsafe.Pointer(&ev.data)) = &netpollBreakRd
+	// 将 “管道有数据到达” 事件注册到Epoll中
+	errno = epollctl(epfd, _EPOLL_CTL_ADD, r, &ev)
+	netpollBreakRd = uintptr(r)
+	netpollBreakWr = uintptr(w)
+}
+```
+
+```go
+// 插入事件
+func netpollopen(fd uintptr, pd *pollDesc) int32 {
+	var ev epollevent
+  // pollDesc指针是Socket相关详细信息 记录了哪个协程休眠在等待此Socket
+	ev.events = _EPOLLIN | _EPOLLOUT | _EPOLLRDHUP | _EPOLLET
+	*(**pollDesc)(unsafe.Pointer(&ev.data)) = pd
+	return -epollctl(epfd, _EPOLL_CTL_ADD, int32(fd), &ev)
+}
+```
 

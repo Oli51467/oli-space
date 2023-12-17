@@ -12,17 +12,26 @@
 
 * 分布式
 
-  - [RPC](./docs/rpc.md)
-  - [分布式锁](./docs/distributed.md)
-
+  - [分布式相关](./docs/distributed.md)
+  
 * MySQL
 
   - [MySQL核心知识](./docs/mysql.md) 
+
+* 组件
+
+  - [组件](./docs/component.md)
 
 * RocketMQ
 
   - [RocketMQ基础](./docs/RocketMQ.md)
 
+  
+  
+  
+  
+  
+  
   
   
   
