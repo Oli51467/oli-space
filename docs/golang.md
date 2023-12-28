@@ -1722,8 +1722,8 @@ func (wg *WaitGroup) Add(delta int) {
 ```go
 // A Once must not be copied after first use.
 type Once struct {
-	done uint32
-	m    Mutex
+	done uint32		// 标识任务有无被触发过
+	m    Mutex		// 保护done变量
 }
 ```
 
@@ -1754,6 +1754,7 @@ func (o *Once) Do(f func()) {
 func (o *Once) doSlow(f func()) {
 	o.m.Lock()
 	defer o.m.Unlock()
+  // 双重检查锁
 	if o.done == 0 {
 		defer atomic.StoreUint32(&o.done, 1)
 		f()
